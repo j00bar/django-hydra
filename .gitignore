@@ -1,0 +1,12 @@
+*.pyc
+*~
+#*#
+bin/
+include/
+lib/
+share/
+.idea/
+.Python
+.DS_Store
+*.egg-info/
+build/
