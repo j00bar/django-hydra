@@ -82,6 +82,7 @@ def get_session_identifier_from_sequence(sender=None, connection=None, **kwargs)
 connection_created.connect(get_session_identifier_from_sequence)
 
 def generate_raw_model_for(model_cls):
+    # FIXME: Throw an error if there's a non-hydrized model with an FK to this one
     name = 'Hydra%s' % model_cls.__name__
     bases = (models.Model,)
     attrs = {'__module__': 'hydra',
@@ -138,28 +139,12 @@ def initialize_model_for_hydra(ModelCls):
                        "ADD CONSTRAINT %(table)s_branch_eff_id_uniq_tgthr UNIQUE (_id, _branch_name)"
                        "" % {'table': ModelCls._meta.db_table})
 
-        # The raw table updated timestamp needs to be updated upon any write
-        # because we need it to determine whether another branch has merged
-        # and there are conflicts to resolve
-        db_cur.execute("CREATE OR REPLACE FUNCTION _hail_hydra_%(table)s_update_timestamp() "
-                       "RETURNS TRIGGER AS $$ "
-                       "BEGIN "
-                       "    NEW._updated = now(); "
-                       "    RETURN NEW; "
-                       "END; "
-                       "$$ language 'plpgsql'"
-                       "" % {'table': ModelCls._meta.db_table})
-        db_cur.execute("CREATE TRIGGER _hail_hydra_%(table)s_update_timestamp "
-                       "BEFORE UPDATE OR DELETE ON _raw_%(table)s FOR EACH ROW "
-                       "EXECUTE PROCEDURE _hail_hydra_%(table)s_update_timestamp()"
-                       "" % {'table': ModelCls._meta.db_table})
-
         # Create view over new table
         fields_except_pk = [field.column for field in ModelCls._meta.fields if not field.primary_key]
         db_cur.execute(
             'CREATE RULE "_RETURN" AS ON SELECT TO %(table)s DO INSTEAD '
             "SELECT id, %(fields)s FROM ("
-            "SELECT _id AS id, %(fields)s, "
+            "SELECT _id AS id, %(fields)s, _deleted, "
             "row_number() OVER (PARTITION BY _id ORDER BY _branch_name) AS _row "
             "FROM _raw_%(table)s "
             "WHERE (_branch_name IS NULL OR _branch_name = hydra_branch())) subq "
@@ -192,7 +177,7 @@ def initialize_model_for_hydra(ModelCls):
             "          SELECT 1 FROM _raw_%(table)s WHERE "
             "          _id = OLD.id AND _branch_name = hydra_branch()); "
             "UPDATE _raw_%(table)s "
-            "SET %(value_map)s "
+            "SET %(value_map)s, _updated = statement_timestamp() "
             "WHERE _id = OLD.id AND "
             "_branch_name IS NOT DISTINCT FROM hydra_branch() "
             "RETURNING _id as id, %(fields)s)"
@@ -207,7 +192,7 @@ def initialize_model_for_hydra(ModelCls):
         db_cur.execute(
             "CREATE RULE _hail_hydra_delete AS ON DELETE TO %(table)s DO INSTEAD "
             "UPDATE _raw_%(table)s "
-            "SET _deleted = 't' "
+            "SET _deleted = 't', _updated = statement_timestamp() "
             "WHERE _id = OLD.id AND "
             "_branch_name IS NOT DISTINCT FROM hydra_branch() "
             "RETURNING id, %(fields)s"

@@ -13,6 +13,7 @@ class Person(models.Model):
 class Reader(Person):
     pass
 
+"""
 class Author(Person):
     pass
 
@@ -25,3 +26,4 @@ class Book(models.Model):
     def __unicode__(self):
         return self.title
 
+"""

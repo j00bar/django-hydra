@@ -9,19 +9,22 @@ from django.conf import settings
 from django.db.models.signals import class_prepared
 
 def activate_branch(branch_obj):
-    if not branch_obj.status == u'open':
+    if not branch_obj.state == u'open':
         raise ValueError('Only open branches can be activated.')
     from django.db import transaction, connections
     cursor = connections['default'].cursor()
     with transaction.atomic():
-        cursor.execute('DELETE FROM _active_branch')
-        cursor.execute('INSERT INTO _active_branch (branch_name) VALUES (%s)',
-                       branch_obj.branch_name)
+        cursor.execute("DELETE FROM hydra_activebranch WHERE "
+                       "session_id = currval('_hydra_session_id_seq')")
+        cursor.execute("INSERT INTO hydra_activebranch (session_id, branch_name) "
+                       "VALUES (currval('_hydra_session_id_seq'), %s)",
+                       (branch_obj.branch_name,))
 
 def deactivate_branch():
     from django.db import connections
     cursor = connections['default'].cursor()
-    cursor.execute('DELETE FROM _active_branch')
+    cursor.execute("DELETE FROM hydra_activebranch WHERE "
+                   "session_id = currval('_hydra_session_id_seq')")
 
 _registered = set()
 def hydrize_model(sender=None, **kwargs):
