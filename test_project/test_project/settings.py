@@ -109,8 +109,8 @@ LOGGING = {
     }
 }
 
-HYDRA_MODELS = [
+HYDRA_MODELS = {
     'test_app.Reader',
-    # 'test_app.Author',
-    # 'test_app.Book'
-]
+    'test_app.Author',
+    'test_app.Book'
+}

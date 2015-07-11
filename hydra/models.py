@@ -10,13 +10,14 @@ import sys
 import django
 from django.conf import settings
 from django.db import models, router, connections, transaction, utils
+from django.db.backends.postgresql_psycopg2.creation import DatabaseCreation
 if django.get_version() < (1,7):
     from django.db.models.signals import post_syncdb as post_migrate
 else:
     from django.db.models.signals import post_migrate
 from django.db.backends.signals import connection_created
 
-from .utils import with_m2ms
+from .utils import with_m2ms, forbidden_models, is_hydrized
 
 class Branch(models.Model):
     branch_name = models.CharField(max_length=50, unique=True)
@@ -35,13 +36,6 @@ class Branch(models.Model):
 class ActiveBranch(models.Model):
     session_id = models.BigIntegerField(primary_key=True)
     branch_name = models.CharField(max_length=50)
-
-def forbidden_models():
-    from django.contrib.auth.models import User, Group, Permission
-    from django.contrib.sites.models import Site
-    from django.contrib.contenttypes.models import ContentType
-    return {User, Group, Permission, Site, ContentType, Branch}
-
 
 def after_hydra_migrate(sender=None, **kwargs):
     if django.get_version() >= (1,7):
@@ -101,7 +95,7 @@ def generate_raw_model_for(model_cls):
     return type(name, bases, attrs)
 
 def generate_hydra_models(for_model):
-    for model_cls in with_m2ms(for_model) - forbidden_models():
+    for model_cls in with_m2ms(for_model) - forbidden_models(as_cls=True):
         setattr(models.get_app('hydra'),
                 'Hydra%s' % model_cls.__name__,
                 generate_raw_model_for(model_cls))
@@ -131,13 +125,52 @@ def initialize_model_for_hydra(ModelCls):
         db_cur.execute('CREATE SEQUENCE _raw_%(table)s__id_seq' %
                        {'table': ModelCls._meta.db_table})
 
+        # Hydra fields need to be added
+        # Unique index on branch + effective ID needs to be added
         db_cur.execute("ALTER TABLE _raw_%(table)s "
                        "ADD COLUMN _id INTEGER NOT NULL, "
                        "ADD COLUMN _deleted BOOLEAN DEFAULT 'f', "
-                       "ADD COLUMN _branch_name VARCHAR(50), "
+                       "ADD COLUMN _branch_name VARCHAR(50) REFERENCES hydra_branch(branch_name), "
                        "ADD COLUMN _updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, "
                        "ADD CONSTRAINT %(table)s_branch_eff_id_uniq_tgthr UNIQUE (_id, _branch_name)"
                        "" % {'table': ModelCls._meta.db_table})
+        # Foreign key constraints between hydrized tables need to be removed
+        creator = DatabaseCreation(connections['default'])
+        for f in ModelCls._meta.fields:
+            if not isinstance(f, models.ForeignKey):
+                continue
+            related_model = f.rel.to
+            if is_hydrized(related_model):
+                db_cur.execute("ALTER TABLE _raw_%(table)s "
+                               "DROP CONSTRAINT %(table)s_%(rel_to_column)s_fkey"
+                               "" % {'table': ModelCls._meta.db_table,
+                                     'rel_to_column': f.column})
+
+        # We have to implement referential integrity using triggers.
+        # * No non-hydrized table will be allowed to reference a column in a
+        #   hydrized table.
+        # * Hydrized tables may contain foreign keys to non-hydrized tables
+        #   and no triggers are needed.
+        # * For hydrized rows referencing columns on other hydrized tables:
+        #   * For INSERT and UPDATE forward consistency:
+        #     * If the row is in the default branch, ensure there exists
+        #       a row with the referenced column value in default
+        #     * If the row is not in the default branch, ensure there exists
+        #       a row with the referenced column value in the branch or default
+        #   * For UPDATE backward consistency:
+        #     * For any model that references an updated row, ensure that
+        #       the referenced value is not changing in the update
+        #   * For DELETE backward consistency:
+        #     * For any model that references a deleted row, ensure that the
+        #       delete cascades
+        #
+        # This leans heavily on the default-delete trigger.
+        # Rows in default referencing something being deleted in
+        # default should spawn non-deleted copies in every open branch before
+        # being cascade deleted. If a row in a branch is deleted, any rows
+        # in the branch referencing it should be deleted, and any rows in default
+        # for which there is not a corresponding row in the branch should spawn
+        # copies and be deleted.
 
         # Create view over new table
         fields_except_pk = [field.column for field in ModelCls._meta.fields if not field.primary_key]
@@ -198,4 +231,36 @@ def initialize_model_for_hydra(ModelCls):
             "RETURNING id, %(fields)s"
             "" % {'table': ModelCls._meta.db_table,
                   'fields': ', '.join(fields_except_pk)}
+        )
+
+        # DELETE trigger for rows in default
+        # Before a row in default is deleted, it needs to spawn non-deleted copies
+        # of itself for all other active branches.
+        db_cur.execute(
+            "CREATE OR REPLACE FUNCTION _hail_hydra_%(table)s_do_def_delete () "
+            "RETURNS trigger AS "
+            "$$ "
+            "BEGIN "
+            "IF NEW._deleted AND NOT OLD._deleted THEN "
+            "INSERT INTO _raw_%(table)s "
+            "(_id, _branch_name, %(fields)s) "
+            "SELECT OLD._id, hydra_branch.branch_name AS _branch_name, %(old_fields)s "
+            "FROM hydra_branch "
+            "WHERE hydra_branch.state = 'open' AND NOT EXISTS ("
+            "          SELECT 1 FROM _raw_%(table)s WHERE "
+            "          _id = OLD.id AND _branch_name = hydra_branch.branch_name); "
+            "END IF; "
+            "RETURN NEW; "
+            "END; "
+            "$$ "
+            "LANGUAGE plpgsql"
+            "" % {'table': ModelCls._meta.db_table,
+                  'fields': ', '.join(fields_except_pk),
+                  'old_fields': ', '.join(['OLD.%s' % f for f in fields_except_pk])}
+        )
+        db_cur.execute(
+            "CREATE TRIGGER _hail_hydra_%(table)s_def_delete_trgr BEFORE UPDATE "
+            "ON _raw_%(table)s FOR EACH ROW WHERE _branch_name IS NULL "
+            "DO _hail_hydra_to_def_delete()"
+            "" % {'table': ModelCls._meta.db_table}
         )

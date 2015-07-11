@@ -6,6 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from django.conf import settings
+from django.db import models
 from django.db.models.signals import class_prepared
 
 def activate_branch(branch_obj):
@@ -29,9 +30,10 @@ def deactivate_branch():
 _registered = set()
 def hydrize_model(sender=None, **kwargs):
     logger.debug('Model %s is ready.', sender)
-    if (sender not in _registered and
+    settings.HYDRA_MODELS = set(getattr(settings, 'HYDRA_MODELS', set()) - forbidden_models())
+    if (sender not in _registered and sender._meta.app_label != 'hydra' and
                 ('%s.%s' % (sender._meta.app_label, sender._meta.model_name)).lower()
-                in [s.lower() for s in getattr(settings, 'HYDRA_MODELS', [])]):
+                in [s.lower() for s in settings.HYDRA_MODELS]):
         logger.info('Generating Hydra models for %s', sender)
         from .models import generate_hydra_models
         generate_hydra_models(sender)

@@ -13,7 +13,6 @@ class Person(models.Model):
 class Reader(Person):
     pass
 
-"""
 class Author(Person):
     pass
 
@@ -21,9 +20,7 @@ class Book(models.Model):
     title = models.CharField(max_length=120)
     author = models.ForeignKey(Author)
     isbn = models.CharField(max_length=120)
-    read_by = models.ManyToManyField(Reader)
+    # read_by = models.ManyToManyField(Reader)
 
     def __unicode__(self):
         return self.title
-
-"""
