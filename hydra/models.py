@@ -134,17 +134,8 @@ def initialize_model_for_hydra(ModelCls):
                        "ADD COLUMN _updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, "
                        "ADD CONSTRAINT %(table)s_branch_eff_id_uniq_tgthr UNIQUE (_id, _branch_name)"
                        "" % {'table': ModelCls._meta.db_table})
-        # Foreign key constraints between hydrized tables need to be removed
-        creator = DatabaseCreation(connections['default'])
-        for f in ModelCls._meta.fields:
-            if not isinstance(f, models.ForeignKey):
-                continue
-            related_model = f.rel.to
-            if is_hydrized(related_model):
-                db_cur.execute("ALTER TABLE _raw_%(table)s "
-                               "DROP CONSTRAINT %(table)s_%(rel_to_column)s_fkey"
-                               "" % {'table': ModelCls._meta.db_table,
-                                     'rel_to_column': f.column})
+
+        fields_except_pk = [field.column for field in ModelCls._meta.fields if not field.primary_key]
 
         # We have to implement referential integrity using triggers.
         # * No non-hydrized table will be allowed to reference a column in a
@@ -171,9 +162,77 @@ def initialize_model_for_hydra(ModelCls):
         # in the branch referencing it should be deleted, and any rows in default
         # for which there is not a corresponding row in the branch should spawn
         # copies and be deleted.
+        # DELETE trigger for rows in default
+        # Before a row in default is deleted, it needs to spawn non-deleted copies
+        # of itself for all other active branches.
+        db_cur.execute(
+            "CREATE OR REPLACE FUNCTION _hail_hydra_%(table)s_do_def_delete () "
+            "RETURNS trigger AS "
+            "$$ "
+            "BEGIN "
+            "IF NEW._deleted AND NOT OLD._deleted THEN "
+            "INSERT INTO _raw_%(table)s "
+            "(_id, _branch_name, %(fields)s) "
+            "SELECT OLD._id, hydra_branch.branch_name AS _branch_name, %(old_fields)s "
+            "FROM hydra_branch "
+            "WHERE hydra_branch.state = 'open' AND NOT EXISTS ("
+            "          SELECT 1 FROM _raw_%(table)s WHERE "
+            "          _id = OLD.id AND _branch_name = hydra_branch.branch_name); "
+            "END IF; "
+            "RETURN NEW; "
+            "END; "
+            "$$ "
+            "LANGUAGE plpgsql"
+            "" % {'table': ModelCls._meta.db_table,
+                  'fields': ', '.join(fields_except_pk),
+                  'old_fields': ', '.join(['OLD.%s' % f for f in fields_except_pk])}
+        )
+
+        db_cur.execute(
+            "CREATE TRIGGER _hail_hydra_%(table)s_def_delete_trgr BEFORE UPDATE "
+            "ON _raw_%(table)s FOR EACH ROW WHERE _branch_name IS NULL "
+            "DO _hail_hydra_to_def_delete()"
+            "" % {'table': ModelCls._meta.db_table}
+        )
+
+        creator = DatabaseCreation(connections['default'])
+        for f in ModelCls._meta.fields:
+            if not isinstance(f, models.ForeignKey):
+                continue
+            related_model = f.rel.to
+            if is_hydrized(related_model):
+                # Foreign key constraints between hydrized tables need to be removed
+                db_cur.execute("ALTER TABLE _raw_%(table)s "
+                               "DROP CONSTRAINT %(table)s_%(column)s_fkey"
+                               "" % {'table': ModelCls._meta.db_table,
+                                     'column': f.column})
+                # These triggers operate on the active branch, so no raw tables
+                db_cur.execute("CREATE FUNCTION _hail_hydra_%(table)s_%(column)s_do_fk_fwd () "
+                               "RETURNS trigger AS "
+                               "$$ "
+                               "BEGIN "
+                               "SELECT 1 FROM %(rel_table)s WHERE "
+                               "%(rel_column)s = NEW.%(column)s; "
+                               "IF NOT FOUND THEN "
+                               "    RAISE 'Foreign key constraint violation %(table)s.%(column)s -> %(rel_table).%(rel_column)s', "
+                               "    USING ERRCODE = 'foreign_key_violation'; "
+                               "ENDIF; "
+                               "RETURN NEW;"
+                               "END; "
+                               "$$ "
+                               "LANGUAGE plpgsql"
+                               "" % {'table': ModelCls._meta.db_table,
+                                     'column': f.column,
+                                     'rel_table': f.rel.to._meta.db_table,
+                                     'rel_column': f.rel.field_name}
+                               )
+                db_cur.execute("CREATE TRIGGER _hail_hydra_%(table)s_%(column)s_fk_fwd_trgr "
+                               "BEFORE INSERT OR UPDATE ON %(table)s FOR EACH ROW "
+                               "DO _hail_hydra_%(table)s_%(column)s_do_fk_fwd()"
+                               "" % {'table': ModelCls._meta.db_table,
+                                     'column': f.column})
 
         # Create view over new table
-        fields_except_pk = [field.column for field in ModelCls._meta.fields if not field.primary_key]
         db_cur.execute(
             'CREATE RULE "_RETURN" AS ON SELECT TO %(table)s DO INSTEAD '
             "SELECT id, %(fields)s FROM ("
@@ -233,34 +292,3 @@ def initialize_model_for_hydra(ModelCls):
                   'fields': ', '.join(fields_except_pk)}
         )
 
-        # DELETE trigger for rows in default
-        # Before a row in default is deleted, it needs to spawn non-deleted copies
-        # of itself for all other active branches.
-        db_cur.execute(
-            "CREATE OR REPLACE FUNCTION _hail_hydra_%(table)s_do_def_delete () "
-            "RETURNS trigger AS "
-            "$$ "
-            "BEGIN "
-            "IF NEW._deleted AND NOT OLD._deleted THEN "
-            "INSERT INTO _raw_%(table)s "
-            "(_id, _branch_name, %(fields)s) "
-            "SELECT OLD._id, hydra_branch.branch_name AS _branch_name, %(old_fields)s "
-            "FROM hydra_branch "
-            "WHERE hydra_branch.state = 'open' AND NOT EXISTS ("
-            "          SELECT 1 FROM _raw_%(table)s WHERE "
-            "          _id = OLD.id AND _branch_name = hydra_branch.branch_name); "
-            "END IF; "
-            "RETURN NEW; "
-            "END; "
-            "$$ "
-            "LANGUAGE plpgsql"
-            "" % {'table': ModelCls._meta.db_table,
-                  'fields': ', '.join(fields_except_pk),
-                  'old_fields': ', '.join(['OLD.%s' % f for f in fields_except_pk])}
-        )
-        db_cur.execute(
-            "CREATE TRIGGER _hail_hydra_%(table)s_def_delete_trgr BEFORE UPDATE "
-            "ON _raw_%(table)s FOR EACH ROW WHERE _branch_name IS NULL "
-            "DO _hail_hydra_to_def_delete()"
-            "" % {'table': ModelCls._meta.db_table}
-        )
