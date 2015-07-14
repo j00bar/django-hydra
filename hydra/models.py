@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 import sys
 
 import django
-from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.db import models, router, connections, transaction, utils
 from django.db.backends.postgresql_psycopg2.creation import DatabaseCreation
 if django.get_version() < (1,7):
@@ -166,7 +166,7 @@ def initialize_model_for_hydra(ModelCls):
         # Before a row in default is deleted, it needs to spawn non-deleted copies
         # of itself for all other active branches.
         db_cur.execute(
-            "CREATE OR REPLACE FUNCTION _hail_hydra_%(table)s_do_def_delete () "
+            "CREATE OR REPLACE FUNCTION _hail_hydra_def_del_%(table)s () "
             "RETURNS trigger AS "
             "$$ "
             "BEGIN "
@@ -189,9 +189,9 @@ def initialize_model_for_hydra(ModelCls):
         )
 
         db_cur.execute(
-            "CREATE TRIGGER _hail_hydra_%(table)s_def_delete_trgr BEFORE UPDATE "
+            "CREATE TRIGGER _hail_hydra_def_del_%(table)s BEFORE UPDATE "
             "ON _raw_%(table)s FOR EACH ROW WHERE _branch_name IS NULL "
-            "DO _hail_hydra_to_def_delete()"
+            "DO _hail_hydra_def_del_%(table)s()"
             "" % {'table': ModelCls._meta.db_table}
         )
 
@@ -206,8 +206,9 @@ def initialize_model_for_hydra(ModelCls):
                                "DROP CONSTRAINT %(table)s_%(column)s_fkey"
                                "" % {'table': ModelCls._meta.db_table,
                                      'column': f.column})
+                # Forward consistency triggers between hydrized tables
                 # These triggers operate on the active branch, so no raw tables
-                db_cur.execute("CREATE FUNCTION _hail_hydra_%(table)s_%(column)s_do_fk_fwd () "
+                db_cur.execute("CREATE FUNCTION _hail_hydra_fwd_%(table)s_%(column)s () "
                                "RETURNS trigger AS "
                                "$$ "
                                "BEGIN "
@@ -226,11 +227,54 @@ def initialize_model_for_hydra(ModelCls):
                                      'rel_table': f.rel.to._meta.db_table,
                                      'rel_column': f.rel.field_name}
                                )
-                db_cur.execute("CREATE TRIGGER _hail_hydra_%(table)s_%(column)s_fk_fwd_trgr "
+                db_cur.execute("CREATE TRIGGER _hail_hydra_fwd_%(table)s_%(column)s "
                                "BEFORE INSERT OR UPDATE ON %(table)s FOR EACH ROW "
-                               "DO _hail_hydra_%(table)s_%(column)s_do_fk_fwd()"
+                               "DO _hail_hydra_fwd_%(table)s_%(column)s()"
                                "" % {'table': ModelCls._meta.db_table,
                                      'column': f.column})
+
+        for rel_obj in ModelCls._meta.get_all_related_objects():
+            rel_model = rel_obj.model._meta.db_table
+            rel_field = rel_obj.field
+            if not is_hydrized(rel_model):
+                # Non-hydrized models may not have FK's to hydrized models
+                raise ImproperlyConfigured('%(rel_table)s.%(rel_column)s has an '
+                                           'FK to %(table)s.%(column)s, but a model '
+                                           'not managed by Hydra may not FK to a '
+                                           'Hydra model.'
+                                           '' % {'rel_table': rel_model._meta.db_table,
+                                                 'table': ModelCls._meta.db_table,
+                                                 'rel_column': rel_field.column,
+                                                 'column': rel_field.rel.field_name})
+            # Backward consistency UPDATE trigger: if a row in "table" changes and
+            # it involves a change to the column that "rel_field" points to,
+            # ensure that there are no rows in rel_table with that value
+            db_cur.execute("CREATE FUNCTION _hail_hydra_ubkwd_%(rel_table)s_%(rel_column)s () "
+                           "RETURN trigger AS "
+                           "$$ "
+                           "BEGIN "
+                           "SELECT 1 FROM %(rel_table)s WHERE "
+                           "%(rel_table)s.%(rel_column)s = OLD.%(column)s; "
+                           "IF FOUND THEN "
+                           "    RAISE 'Integrity violation %(rel_table)s.%(rel_column)s -> %(table)s.%(column)s', "
+                           "    USING ERRCODE = 'integrity_constraint_violation';"
+                           "ENDIF; "
+                           "END; "
+                           "$$ "
+                           "LANGUAGE plpgsql"
+                           "" % {'rel_table': rel_model._meta.db_table,
+                                 'table': ModelCls._meta.db_table,
+                                 'rel_column': rel_field.column,
+                                 'column': rel_field.rel.field_name})
+            db_cur.execute("CREATE TRIGGER _hail_hydra_ubkwd_%(rel_table)s_%(rel_column)s "
+                           "BEFORE UPDATE ON %(table)s FOR EACH ROW "
+                           "WHERE OLD.%(column)s IS DISTINCT FROM NEW.%(columns)s "
+                           "DO _hail_hydra_ubkwd_%(rel_table)s_%(rel_column)s()"
+                           "" % {'rel_table': rel_model._meta.db_table,
+                                 'table': ModelCls._meta.db_table,
+                                 'rel_column': rel_field.column,
+                                 'column': rel_field.rel.field_name})
+
 
         # Create view over new table
         db_cur.execute(
